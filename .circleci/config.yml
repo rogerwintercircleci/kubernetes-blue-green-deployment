@@ -1,0 +1,168 @@
+version: 2.1
+
+commands:
+  setup-kubectl:
+    description: Install kubectl and configure cluster access
+    steps:
+      - run:
+          name: Install kubectl
+          command: |
+            KUBECTL_VERSION=$(curl -L -s https://dl.k8s.io/release/stable.txt)
+            curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+            chmod +x kubectl
+            sudo mv kubectl /usr/local/bin/kubectl
+      - run:
+          name: Configure kubeconfig
+          command: |
+            mkdir -p ~/.kube
+            echo "$KUBECONFIG_DATA" | tr -d '[:space:]' | base64 --decode > ~/.kube/config
+            chmod 600 ~/.kube/config
+
+jobs:
+  build-and-push:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run:
+          name: Build Docker image
+          command: |
+            docker build -t $DOCKERHUB_USERNAME/blue-green-tutorial-app:$CIRCLE_SHA1 ./app
+      - run:
+          name: Push to Docker Hub
+          command: |
+            echo "$DOCKERHUB_PASSWORD" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+            docker push $DOCKERHUB_USERNAME/blue-green-tutorial-app:$CIRCLE_SHA1
+
+  deploy-to-green:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - setup-kubectl
+      - run:
+          name: Install envsubst
+          command: sudo apt-get update -qq && sudo apt-get install -y gettext-base
+      - run:
+          name: Deploy to green environment
+          command: |
+            export IMAGE_TAG=$CIRCLE_SHA1
+            envsubst < k8s/deployment-green.yml | kubectl apply -f -
+            kubectl apply -f k8s/service.yml
+            kubectl apply -f k8s/service-preview.yml
+      - run:
+          name: Wait for green rollout
+          command: kubectl rollout status deployment/blue-green-tutorial-app-green --timeout=5m
+
+  validate-green:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - setup-kubectl
+      - run:
+          name: Get preview service endpoint
+          command: |
+            echo "Waiting for preview service external IP..."
+            for i in $(seq 1 30); do
+              PREVIEW_IP=$(kubectl get svc blue-green-tutorial-app-preview -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+              if [ -n "$PREVIEW_IP" ]; then
+                echo "Preview IP: $PREVIEW_IP"
+                echo "export PREVIEW_IP=$PREVIEW_IP" >> "$BASH_ENV"
+                break
+              fi
+              echo "Attempt $i: waiting for external IP..."
+              sleep 10
+            done
+            if [ -z "$PREVIEW_IP" ]; then
+              echo "ERROR: Preview service did not receive an external IP"
+              exit 1
+            fi
+      - run:
+          name: Smoke test - health check
+          command: |
+            curl -sf http://$PREVIEW_IP/health | grep -q '"status":"ok"'
+            echo "Health check passed"
+      - run:
+          name: Smoke test - version check
+          command: |
+            RESPONSE=$(curl -sf http://$PREVIEW_IP/api)
+            echo "Response: $RESPONSE"
+            echo "$RESPONSE" | grep -q "$CIRCLE_SHA1"
+            echo "Version check passed: $CIRCLE_SHA1"
+      - run:
+          name: Smoke test - slot check
+          command: |
+            RESPONSE=$(curl -sf http://$PREVIEW_IP/api)
+            echo "$RESPONSE" | grep -q '"slot":"green"'
+            echo "Slot check passed: green"
+
+  switch-traffic:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - setup-kubectl
+      - run:
+          name: Plan deployment
+          command: |
+            circleci run release plan "${CIRCLE_JOB}" \
+              --environment-name="production" \
+              --component-name="blue-green-tutorial-app" \
+              --target-version="$CIRCLE_SHA1"
+      - run:
+          name: Switch production traffic to green
+          command: |
+            kubectl patch svc blue-green-tutorial-app \
+              -p '{"spec":{"selector":{"version":"green"}}}'
+      - run:
+          name: Verify traffic switch
+          command: |
+            PROD_IP=$(kubectl get svc blue-green-tutorial-app -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            RESPONSE=$(curl -sf http://$PROD_IP/api)
+            echo "Production response: $RESPONSE"
+            echo "$RESPONSE" | grep -q '"slot":"green"'
+            echo "Traffic switch verified"
+      - run:
+          name: Update deployment status to running
+          command: circleci run release update "${CIRCLE_JOB}" --status=RUNNING
+      - run:
+          name: Log deploy marker
+          command: |
+            circleci run release log \
+              --component-name=blue-green-tutorial-app \
+              --environment-name=production \
+              --target-version=$CIRCLE_SHA1
+      - run:
+          name: Update deployment status to success
+          command: circleci run release update "${CIRCLE_JOB}" --status=SUCCESS
+          when: on_success
+      - run:
+          name: Update deployment status to failed
+          command: circleci run release update "${CIRCLE_JOB}" --status=FAILED
+          when: on_fail
+
+workflows:
+  build-deploy:
+    jobs:
+      - build-and-push:
+          context: blue-green-tutorial
+      - deploy-to-green:
+          requires:
+            - build-and-push
+          context: blue-green-tutorial
+          filters:
+            branches:
+              only: main
+      - validate-green:
+          requires:
+            - deploy-to-green
+          context: blue-green-tutorial
+      - hold-for-approval:
+          type: approval
+          requires:
+            - validate-green
+      - switch-traffic:
+          requires:
+            - hold-for-approval
+          context: blue-green-tutorial

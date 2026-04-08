@@ -1,0 +1,77 @@
+version: 2.1
+
+commands:
+  setup-kubectl:
+    description: Install kubectl and configure cluster access
+    steps:
+      - run:
+          name: Install kubectl
+          command: |
+            KUBECTL_VERSION=$(curl -L -s https://dl.k8s.io/release/stable.txt)
+            curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+            chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+      - run:
+          name: Configure kubeconfig
+          command: |
+            mkdir -p ~/.kube
+            echo "$KUBECONFIG_DATA" | tr -d '[:space:]' | base64 --decode > ~/.kube/config
+            chmod 600 ~/.kube/config
+
+jobs:
+  rollback:
+    docker:
+      - image: cimg/base:stable
+    environment:
+      COMPONENT_NAME: << pipeline.deploy.component_name >>
+      ENVIRONMENT_NAME: << pipeline.deploy.environment_name >>
+      TARGET_VERSION: << pipeline.deploy.target_version >>
+    steps:
+      - setup-kubectl
+      - run:
+          name: Plan rollback release
+          command: |
+            circleci run release plan "${CIRCLE_JOB}" \
+              --component-name=${COMPONENT_NAME} \
+              --environment-name=${ENVIRONMENT_NAME} \
+              --target-version=${TARGET_VERSION} \
+              --rollback
+      - run:
+          name: Switch production traffic back to blue
+          command: |
+            kubectl patch svc blue-green-tutorial-app \
+              -p '{"spec":{"selector":{"version":"blue"}}}'
+      - run:
+          name: Verify rollback
+          command: |
+            PROD_IP=$(kubectl get svc blue-green-tutorial-app -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            RESPONSE=$(curl -sf http://$PROD_IP/api)
+            echo "Production response after rollback: $RESPONSE"
+            echo "$RESPONSE" | grep -q '"slot":"blue"'
+            echo "Rollback verified: traffic is back on blue"
+      - run:
+          name: Update rollback status to SUCCESS
+          command: circleci run release update "${CIRCLE_JOB}" --status=SUCCESS
+          when: on_success
+      - run:
+          name: Update rollback status to FAILED
+          command: circleci run release update "${CIRCLE_JOB}" --status=FAILED
+          when: on_fail
+
+  cancel-rollback:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - run:
+          name: Update rollback status to CANCELED
+          command: circleci run release update "${CIRCLE_JOB}" --status=CANCELED
+
+workflows:
+  rollback:
+    jobs:
+      - rollback:
+          context: blue-green-tutorial
+      - cancel-rollback:
+          context: blue-green-tutorial
+          requires:
+            - rollback:
+              - canceled

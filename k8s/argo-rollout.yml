@@ -1,0 +1,44 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: blue-green-tutorial-app
+  namespace: default
+spec:
+  replicas: 3
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      app: blue-green-tutorial-app
+  template:
+    metadata:
+      labels:
+        app: blue-green-tutorial-app
+    spec:
+      containers:
+        - name: blue-green-tutorial-app
+          image: <DOCKERHUB_USERNAME>/blue-green-tutorial-app:<TAG>
+          ports:
+            - containerPort: 3000
+          env:
+            - name: APP_VERSION
+              value: "<TAG>"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+  strategy:
+    blueGreen:
+      activeService: blue-green-tutorial-app
+      previewService: blue-green-tutorial-app-preview
+      autoPromotionEnabled: false
+      previewReplicaCount: 3
+      scaleDownDelaySeconds: 30
