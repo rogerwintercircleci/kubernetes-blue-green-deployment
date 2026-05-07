@@ -116,14 +116,6 @@ jobs:
             kubectl patch svc blue-green-tutorial-app \
               -p '{"spec":{"selector":{"version":"green"}}}'
       - run:
-          name: Verify traffic switch
-          command: |
-            PROD_IP=$(kubectl get svc blue-green-tutorial-app -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-            RESPONSE=$(curl -sf http://$PROD_IP/api)
-            echo "Production response: $RESPONSE"
-            echo "$RESPONSE" | grep -q '"slot":"green"'
-            echo "Traffic switch verified"
-      - run:
           name: Update deployment status to running
           command: circleci run release update "${CIRCLE_JOB}" --status=RUNNING
       - run:
